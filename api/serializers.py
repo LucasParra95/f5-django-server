@@ -200,11 +200,12 @@ class PartidoListSerializer(serializers.ModelSerializer):
     cancha_nombre = serializers.CharField(source='cancha.nombre', read_only=True)
     participantes_count = serializers.SerializerMethodField()
     cupo_disponible = serializers.SerializerMethodField()
+    invitacion = InvitacionSerializer(read_only=True)
 
     class Meta:
         model = Partido
         fields = ['id', 'fecha_hora', 'organizador', 'organizador_nombre',
-                  'cancha', 'cancha_nombre', 'cupo_total', 'periodicidad',
+                  'cancha', 'cancha_nombre', 'cupo_total', 'invitacion', 'periodicidad',
                   'equipos_definidos', 'participantes_count', 'cupo_disponible',
                   'created_at']
         read_only_fields = fields
