@@ -296,22 +296,19 @@ class EstadisticasPartido(models.Model):
 # NOTIFICACIÓN
 # ============================================================================
 class Notificacion(models.Model):
-    """
-    Modelo de Notificaciones. Se generan cuando hay eventos importantes.
-    Ej: cambio de equipo, cancelación, etc.
-    """
-    TIPO_CHOICES = [
-        ('cambio_equipo', 'Cambio de Equipo'),
-        ('cancelacion_invitacion', 'Cancelación de Invitación'),
-        ('resultado_cargado', 'Resultado Cargado'),
-        ('baneado', 'Has sido baneado'),
-        ('otro', 'Otro'),
-    ]
+    class Tipo(models.TextChoices):
+        PARTIDO_MODIFICADO = 'partido_modificado', 'Partido modificado'
+        PARTIDO_CANCELADO = 'partido_cancelado', 'Partido cancelado'
+        RESULTADO_CARGADO = 'resultado_cargado', 'Resultado cargado'
+        PARTICIPANTE_NUEVO = 'participante_nuevo', 'Nuevo participante'
+        CAMBIO_EQUIPO = 'cambio_equipo', 'Cambio de equipo'
+        BANEADO = 'baneado', 'Has sido baneado'
+        OTRO = 'otro', 'Otro'
 
     id = models.AutoField(primary_key=True)
     usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='notificaciones')
     partido = models.ForeignKey(Partido, on_delete=models.CASCADE, related_name='notificaciones')
-    tipo = models.CharField(max_length=50, choices=TIPO_CHOICES)
+    tipo = models.CharField(max_length=50, choices=Tipo.choices)
     mensaje = models.TextField()
     leida = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

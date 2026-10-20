@@ -14,7 +14,7 @@ from api.serializers import (
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
 from django.db.models import Q
-
+from api.services.notifications import notificar_participantes
 # ============================================================================
 # PERMISOS PERSONALIZADOS
 # ============================================================================
@@ -206,7 +206,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
             Notificacion.objects.create(
                 usuario=participacion.usuario,
                 partido=partido,
-                tipo='cambio_equipo',
+                tipo=Notificacion.Tipo.CAMBIO_EQUIPO,
                 mensaje=f"Tu equipo ha sido cambiado a Equipo {nuevo_equipo}"
             )
 
@@ -236,7 +236,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
         Notificacion.objects.create(
             usuario=participacion.usuario,
             partido=partido,
-            tipo='baneado',
+            tipo=Notificacion.Tipo.BANEADO,
             mensaje=f"Has sido baneado del partido del {partido.fecha_hora.strftime('%d/%m/%Y')}"
         )
 
@@ -282,6 +282,39 @@ class PartidoViewSet(viewsets.ModelViewSet):
         serializer = PartidoDetailSerializer(partido)
         return Response(serializer.data)
 
+    def perform_update(self, serializer):
+        partido_anterior = serializer.instance
+        horario_anterior = partido_anterior.fecha_hora
+        cancha_anterior = partido_anterior.cancha
+        cupo_anterior = partido_anterior.cupo_total
+
+        partido = serializer.save()
+
+        cambios = []
+
+        if horario_anterior != partido.fecha_hora:
+            cambios.append(
+                f"horario de {horario_anterior:%d/%m %H:%M} "
+                f"a {partido.fecha_hora:%d/%m %H:%M}"
+            )
+
+        if cancha_anterior != partido.cancha:
+            cambios.append(
+                f"cancha de {cancha_anterior.nombre} a {partido.cancha.nombre}"
+            )
+
+        if cupo_anterior != partido.cupo_total:
+            cambios.append(
+                f"cupo de {cupo_anterior} a {partido.cupo_total} jugadores"
+            )
+
+        if cambios:
+            notificar_participantes(
+                partido,
+                tipo=Notificacion.Tipo.PARTIDO_MODIFICADO,
+                mensaje=f"Se modificó el partido: {'; '.join(cambios)}",
+                excluir_usuario=self.request.user,
+            )
 
 # ============================================================================
 # RESULTADO Y ESTADÍSTICAS
@@ -378,8 +411,8 @@ class ResultadoViewSet(viewsets.ModelViewSet):
             Notificacion.objects.create(
                 usuario_id=usuario_id,
                 partido=partido,
-                tipo='resultado_cargado',
-                mensaje=f"El resultado del partido ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                tipo=Notificacion.Tipo.RESULTADO_CARGADO,
+                mensaje=f"El resultado del partido del dia {partido.fecha} ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
             )
 
         serializer = ResultadoSerializer(resultado)
@@ -511,6 +544,13 @@ class AceptarInvitacionView(APIView):
             usuario=usuario,
             estado=estado,
             equipo_asignado=equipo
+        )
+
+        notificar_participantes(
+            partido,
+            tipo=Notificacion.Tipo.PARTICIPANTE_NUEVO,
+            mensaje=f"Se unió un nuevo participante al partido: {usuario.nombre} (Equipo {equipo})",
+            excluir_usuario=self.request.user,
         )
 
         serializer = ParticipacionPartidoSerializer(participacion)
