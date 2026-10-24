@@ -99,11 +99,11 @@ class TokenObtainPairSerializerCustom(serializers.Serializer):
         refresh['nombre'] = user.nombre
         refresh['user_id'] = user.id
         
-        attrs['refresh'] = str(refresh)
-        attrs['access'] = str(refresh.access_token)
-        attrs['user'] = UsuarioSerializer(user).data
-        
-        return attrs
+        return {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'user': UsuarioSerializer(user).data,
+        }
 
 # ============================================================================
 # CANCHA
