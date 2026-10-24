@@ -437,8 +437,7 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
         notificacion = self.get_object()
         notificacion.leida = True
         notificacion.save()
-        serializer = self.get_serializer(notificacion)
-        return Response(serializer.data)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=['patch'])
     def marcar_todas_leidas(self, request):
@@ -447,7 +446,7 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
             usuario=request.user,
             leida=False
         ).update(leida=True)
-        return Response({"mensaje": "Todas las notificaciones marcadas como leídas"})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ============================================================================
