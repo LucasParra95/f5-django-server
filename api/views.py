@@ -14,6 +14,8 @@ from api.serializers import (
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
 from django.db.models import Q
+from django.db import transaction
+from django.utils import timezone
 from api.services.notifications import notificar_participantes
 # ============================================================================
 # PERMISOS PERSONALIZADOS
@@ -149,14 +151,11 @@ class PartidoViewSet(viewsets.ModelViewSet):
             return PartidoDetailSerializer
         return PartidoListSerializer
 
-    def create(self, request, *args, **kwargs):
-        """Crear nuevo partido (solo usuarios registrados)"""
-        if not request.user.is_registered:
-            return Response(
-                {"error": "Solo usuarios registrados pueden crear partidos"},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        return super().create(request, *args, **kwargs)
+    def get_permissions(self):
+        """Solo usuarios registrados pueden crear partidos"""
+        if self.action == 'create':
+            return [EsUsuarioAutenticado()]
+        return super().get_permissions()
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def cambiar_equipo(self, request, pk=None):
@@ -381,39 +380,43 @@ class ResultadoViewSet(viewsets.ModelViewSet):
             )
 
         # Crear resultado
-        resultado = Resultado.objects.create(
-            partido=partido,
-            equipo_a_goles=equipo_a_goles,
-            equipo_b_goles=equipo_b_goles,
-            cargado_por=request.user
-        )
+        fecha = timezone.localtime(partido.fecha_hora)
 
-        # Crear estadísticas por jugador
-        for stat in estadisticas_data:
-            usuario_id = stat.get('usuario_id')
-            usuario = get_object_or_404(Usuario, id=usuario_id)
-
-            EstadisticasPartido.objects.create(
-                resultado=resultado,
-                usuario=usuario,
-                goles=stat.get('goles'),
-                tarjetas_amarillas=stat.get('amarillas'),
-                tarjetas_rojas=stat.get('rojas')
-            )
-
-        # Crear notificaciones
-        participantes = ParticipacionPartido.objects.filter(
-            partido=partido,
-            usuario__is_registered=True
-        ).values_list('usuario_id', flat=True)
-
-        for usuario_id in participantes:
-            Notificacion.objects.create(
-                usuario_id=usuario_id,
+        with transaction.atomic():
+            # Crear resultado
+            resultado = Resultado.objects.create(
                 partido=partido,
-                tipo=Notificacion.Tipo.RESULTADO_CARGADO,
-                mensaje=f"El resultado del partido del dia {partido.fecha} ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                equipo_a_goles=equipo_a_goles,
+                equipo_b_goles=equipo_b_goles,
+                cargado_por=request.user
             )
+
+            # Crear estadísticas por jugador
+            for stat in estadisticas_data:
+                usuario_id = stat.get('usuario_id')
+                usuario = get_object_or_404(Usuario, id=usuario_id)
+
+                EstadisticasPartido.objects.create(
+                    resultado=resultado,
+                    usuario=usuario,
+                    goles=stat.get('goles'),
+                    tarjetas_amarillas=stat.get('amarillas'),
+                    tarjetas_rojas=stat.get('rojas')
+                )
+
+            # Crear notificaciones
+            participantes = ParticipacionPartido.objects.filter(
+                partido=partido,
+                usuario__is_registered=True
+            ).values_list('usuario_id', flat=True)
+
+            for usuario_id in participantes:
+                Notificacion.objects.create(
+                    usuario_id=usuario_id,
+                    partido=partido,
+                    tipo=Notificacion.Tipo.RESULTADO_CARGADO,
+                    mensaje=f"El resultado del partido del día {fecha:%d/%m/%Y} ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                )
 
         serializer = ResultadoSerializer(resultado)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
