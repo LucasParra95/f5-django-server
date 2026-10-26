@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, generics, permissions
+from rest_framework import viewsets, mixins, status, generics, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,9 +8,9 @@ from api.models import (
     Resultado, EstadisticasPartido, Notificacion
 )
 from api.serializers import (
-    UsuarioSerializer, UsuarioRegistroSerializer, UsuarioPerfilSerializer,
+    UsuarioRegistroSerializer, UsuarioPerfilSerializer,
     CanchaSerializer, PartidoListSerializer,
-    PartidoDetailSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
+    PartidoDetailSerializer, PartidoPublicoSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
 from django.db.models import Q
@@ -56,15 +56,11 @@ class RegistroView(generics.CreateAPIView):
 # ============================================================================
 # USUARIO
 # ============================================================================
-class UsuarioViewSet(viewsets.ModelViewSet):
-    """ViewSet para gestionar usuarios"""
+class UsuarioViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    """ViewSet de solo lectura: perfil por id y perfil propio (me)"""
     queryset = Usuario.objects.all()
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
-
-    def get_serializer_class(self):
-        if self.action == 'retrieve':
-            return UsuarioPerfilSerializer
-        return UsuarioSerializer
+    serializer_class = UsuarioPerfilSerializer
+    permission_classes = [EsUsuarioAutenticado]
 
     @action(detail=False, methods=['get'], permission_classes=[EsUsuarioAutenticado])
     def me(self, request):
@@ -119,7 +115,10 @@ class CanchaViewSet(viewsets.ModelViewSet):
     queryset = Cancha.objects.all()
     serializer_class = CanchaSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    http_method_names = ['get', 'post', 'head', 'options']
 
+    def perform_create(self, serializer):
+        serializer.save(creado_por=self.request.user)
 
 # ============================================================================
 # PARTIDO
@@ -127,6 +126,8 @@ class CanchaViewSet(viewsets.ModelViewSet):
 class PartidoViewSet(viewsets.ModelViewSet):
     """ViewSet principal para partidos"""
     permission_classes = [permissions.AllowAny]
+    # Sin DELETE: la baja de un partido será lógica (pendiente)
+    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
     filterset_fields = ['organizador', 'cancha', 'periodicidad']
     ordering_fields = ['fecha_hora', 'created_at']
     ordering = ['-fecha_hora']
@@ -153,8 +154,14 @@ class PartidoViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         """Solo usuarios registrados pueden crear partidos"""
+        """
+        - create: solo usuarios registrados
+        - update/partial_update: solo el organizador (EsOrganizador se evalúa en get_object)
+        """
         if self.action == 'create':
             return [EsUsuarioAutenticado()]
+        if self.action in ('update', 'partial_update'):
+            return [EsUsuarioAutenticado(), EsOrganizador()]
         return super().get_permissions()
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
@@ -318,7 +325,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
 # ============================================================================
 # RESULTADO Y ESTADÍSTICAS
 # ============================================================================
-class ResultadoViewSet(viewsets.ModelViewSet):
+class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet para resultados de partidos"""
     queryset = Resultado.objects.all()
     serializer_class = ResultadoSerializer
@@ -469,7 +476,7 @@ class InvitacionPorCodigoView(APIView):
             )
         
         partido = invitacion.partido
-        serializer = PartidoDetailSerializer(partido)
+        serializer = PartidoPublicoSerializer(partido)
         return Response({'partido': serializer.data})
 
 
@@ -513,6 +520,11 @@ class AceptarInvitacionView(APIView):
                 email=email,
                 defaults={'nombre': nombre, 'is_registered': False}
             )
+            if usuario.is_registered:
+                return Response(
+                    {'error': 'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         # Verificar si ya participa
         if ParticipacionPartido.objects.filter(partido=partido, usuario=usuario).exists():

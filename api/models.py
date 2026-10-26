@@ -60,6 +60,10 @@ class Cancha(models.Model):
     provincia = models.CharField(max_length=150)
     telefono = models.CharField(max_length=20, null=True, blank=True)
     sitio_web = models.URLField(null=True, blank=True)
+    creado_por = models.ForeignKey(
+        Usuario, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='canchas_creadas'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

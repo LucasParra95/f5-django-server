@@ -15,7 +15,7 @@ class UsuarioSerializer(serializers.ModelSerializer):
     class Meta:
         model = Usuario
         fields = ['id', 'nombre', 'email', 'is_registered', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'is_registered', 'created_at']
 
 
 class UsuarioRegistroSerializer(serializers.ModelSerializer):
@@ -184,6 +184,13 @@ class ParticipacionPartidoSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
+class ParticipacionPartidoPublicaSerializer(ParticipacionPartidoSerializer):
+    """Participación sin datos de contacto, para vistas públicas"""
+    class Meta(ParticipacionPartidoSerializer.Meta):
+        fields = ['id', 'usuario_nombre', 'estado', 'equipo_asignado']
+        read_only_fields = fields
+
+
 class ParticipacionPartidoCrearSerializer(serializers.ModelSerializer):
     """Serializer simplificado para crear/actualizar participación"""
     class Meta:
@@ -245,6 +252,13 @@ class PartidoDetailSerializer(serializers.ModelSerializer):
 
     def get_en_espera_count(self, obj):
         return obj.participaciones.filter(estado='en_espera').count()
+
+
+class PartidoPublicoSerializer(PartidoDetailSerializer):
+    """Detalle de partido para quien llega por código de invitación (sin emails)"""
+    participantes = ParticipacionPartidoPublicaSerializer(
+        source='participaciones', many=True, read_only=True
+    )
 
 
 class PartidoCrearSerializer(serializers.ModelSerializer):
