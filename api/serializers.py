@@ -26,6 +26,13 @@ class UsuarioRegistroSerializer(serializers.ModelSerializer):
     class Meta:
         model = Usuario
         fields = ['nombre', 'email', 'password', 'password2']
+        # La unicidad se valida en validate_email: un fantasma puede reclamar su email
+        extra_kwargs = {'email': {'validators': []}}
+
+    def validate_email(self, value):
+        if Usuario.objects.filter(email=value, is_registered=True).exists():
+            raise serializers.ValidationError("Ya existe una cuenta con este email.")
+        return value
 
     def validate(self, data):
         if data['password'] != data['password2']:
@@ -35,7 +42,13 @@ class UsuarioRegistroSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data.pop('password2')
         password = validated_data.pop('password')
-        user = Usuario(**validated_data)
+        # validate_email descartó los registrados: si el email existe, es un fantasma
+        # y se reutiliza la misma fila para conservar su historial de partidos
+        user = Usuario.objects.filter(email=validated_data['email']).first()
+        if user is None:
+            user = Usuario(**validated_data)
+        else:
+            user.nombre = validated_data['nombre']        
         user.password_hash = make_password(password)
         user.is_registered = True
         user.save()
@@ -83,7 +96,7 @@ class TokenObtainPairSerializerCustom(serializers.Serializer):
             raise serializers.ValidationError("Email y password requeridos")
         
         try:
-            user = Usuario.objects.get(email=email, is_registered=True)
+            user = Usuario.objects.get(email=email.lower(), is_registered=True)
         except Usuario.DoesNotExist:
             raise serializers.ValidationError("Email o contraseña incorrectos")
         
@@ -259,6 +272,27 @@ class PartidoPublicoSerializer(PartidoDetailSerializer):
     participantes = ParticipacionPartidoPublicaSerializer(
         source='participaciones', many=True, read_only=True
     )
+
+
+class PartidoEditarSerializer(serializers.ModelSerializer):
+    """Serializer para que el organizador edite fecha, cancha y cupo"""
+    class Meta:
+        model = Partido
+        fields = ['cancha', 'fecha_hora', 'cupo_total']
+
+    def validate_cupo_total(self, value):
+        """El nuevo cupo no puede dejar sin lugar a jugadores activos de un equipo"""
+        cupo_equipo = value // 2
+        for equipo in ('A', 'B'):
+            activos = self.instance.participaciones.filter(
+                estado='activo', equipo_asignado=equipo
+            ).count()
+            if activos > cupo_equipo:
+                raise serializers.ValidationError(
+                    f"El equipo {equipo} ya tiene {activos} jugadores activos "
+                    f"y el nuevo cupo admite {cupo_equipo} por equipo."
+                )
+        return value
 
 
 class PartidoCrearSerializer(serializers.ModelSerializer):

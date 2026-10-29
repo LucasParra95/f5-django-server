@@ -10,7 +10,7 @@ from api.models import (
 from api.serializers import (
     UsuarioRegistroSerializer, UsuarioPerfilSerializer,
     CanchaSerializer, PartidoListSerializer,
-    PartidoDetailSerializer, PartidoPublicoSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
+    PartidoDetailSerializer, PartidoPublicoSerializer, PartidoEditarSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
 from django.db.models import Q
@@ -68,44 +68,6 @@ class UsuarioViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         serializer = UsuarioPerfilSerializer(request.user)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
-    def vincular_fantasma(self, request, pk=None):
-        """
-        Vincular un usuario fantasma a usuario registrado.
-        Busca por email si hay un usuario sin registrar, lo vincula.
-        """
-        usuario_registrado = self.get_object()
-        
-        if not usuario_registrado.is_registered:
-            return Response(
-                {"error": "El usuario debe estar registrado"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Buscar usuario fantasma con mismo email
-        usuario_fantasma = Usuario.objects.filter(
-            email=usuario_registrado.email,
-            is_registered=False
-        ).first()
-
-        if not usuario_fantasma:
-            return Response(
-                {"error": "No hay usuario fantasma con este email"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Reasignar todas las participaciones al usuario registrado
-        ParticipacionPartido.objects.filter(usuario=usuario_fantasma).update(
-            usuario=usuario_registrado
-        )
-
-        usuario_fantasma.delete()
-
-        return Response(
-            {"mensaje": "Participaciones vinculadas correctamente"},
-            status=status.HTTP_200_OK
-        )
-
 
 # ============================================================================
 # CANCHA
@@ -148,6 +110,8 @@ class PartidoViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return PartidoCrearSerializer
+        elif self.action in ('update', 'partial_update'):
+            return PartidoEditarSerializer
         elif self.action == 'retrieve':
             return PartidoDetailSerializer
         return PartidoListSerializer
@@ -299,15 +263,14 @@ class PartidoViewSet(viewsets.ModelViewSet):
         cambios = []
 
         if horario_anterior != partido.fecha_hora:
+            anterior = timezone.localtime(horario_anterior)
+            nuevo = timezone.localtime(partido.fecha_hora)
             cambios.append(
-                f"horario de {horario_anterior:%d/%m %H:%M} "
-                f"a {partido.fecha_hora:%d/%m %H:%M}"
+                f"horario de {anterior:%d/%m %H:%M} a {nuevo:%d/%m %H:%M}"
             )
 
         if cancha_anterior != partido.cancha:
-            cambios.append(
-                f"cancha de {cancha_anterior.nombre} a {partido.cancha.nombre}"
-            )
+            cambios.append(f"cancha de {cancha_anterior.nombre} a {partido.cancha.nombre}")
 
         if cupo_anterior != partido.cupo_total:
             cambios.append(
@@ -489,7 +452,7 @@ class AceptarInvitacionView(APIView):
         
         codigo = request.data.get('codigo_unico')
         nombre = request.data.get('nombre')
-        email = request.data.get('email')
+        email = (request.data.get('email') or '').strip().lower()
         equipo = request.data.get('equipo', 'A')
 
         # Validar código de invitación

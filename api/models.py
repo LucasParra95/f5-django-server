@@ -41,6 +41,10 @@ class Usuario(models.Model):
             models.Index(fields=['email']),
         ]
 
+    def save(self, *args, **kwargs):
+        self.email = self.email.lower()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         estado = "Registrado" if self.is_registered else "Fantasma"
         return f"{self.nombre} ({self.email}) - {estado}"
@@ -135,7 +139,7 @@ class Partido(models.Model):
 
     id = models.AutoField(primary_key=True)
     organizador = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='partidos_creados')
-    cancha = models.ForeignKey(Cancha, on_delete=models.SET_NULL, null=True, blank=True)
+    cancha = models.ForeignKey(Cancha, on_delete=models.PROTECT)
     fecha_hora = models.DateTimeField()
     cupo_total = models.IntegerField(validators=[MinValueValidator(4)])  # Mínimo 4 jugadores
     periodicidad = models.CharField(max_length=20, choices=PERIODICIDAD_CHOICES, default='unico')
@@ -179,7 +183,7 @@ class Partido(models.Model):
         return total_participantes < limite_espera
 
     def __str__(self):
-        return f"Partido {self.fecha_hora.strftime('%d/%m/%Y %H:%M')} - {self.cancha.nombre if self.cancha else 'Sin cancha'}"
+        return f"Partido {self.fecha_hora.strftime('%d/%m/%Y %H:%M')} - {self.cancha.nombre}"
 
 
 # ============================================================================
