@@ -1,5 +1,5 @@
 {
-  "buildCommand": "pip install -r requirements.txt && python manage.py migrate",
+  "buildCommand": "pip install -r requirements.txt && python manage.py makemigrations && python manage.py migrate",
   "outputDirectory": ".",
   "env": {
     "DJANGO_SETTINGS_MODULE": "f5club_servidor.settings"
