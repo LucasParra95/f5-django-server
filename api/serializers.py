@@ -15,7 +15,7 @@ class UsuarioSerializer(serializers.ModelSerializer):
     class Meta:
         model = Usuario
         fields = ['id', 'nombre', 'email', 'is_registered', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'is_registered', 'created_at']
 
 
 class UsuarioRegistroSerializer(serializers.ModelSerializer):
@@ -26,6 +26,13 @@ class UsuarioRegistroSerializer(serializers.ModelSerializer):
     class Meta:
         model = Usuario
         fields = ['nombre', 'email', 'password', 'password2']
+        # La unicidad se valida en validate_email: un fantasma puede reclamar su email
+        extra_kwargs = {'email': {'validators': []}}
+
+    def validate_email(self, value):
+        if Usuario.objects.filter(email=value, is_registered=True).exists():
+            raise serializers.ValidationError("Ya existe una cuenta con este email.")
+        return value
 
     def validate(self, data):
         if data['password'] != data['password2']:
@@ -35,7 +42,13 @@ class UsuarioRegistroSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data.pop('password2')
         password = validated_data.pop('password')
-        user = Usuario(**validated_data)
+        # validate_email descartó los registrados: si el email existe, es un fantasma
+        # y se reutiliza la misma fila para conservar su historial de partidos
+        user = Usuario.objects.filter(email=validated_data['email']).first()
+        if user is None:
+            user = Usuario(**validated_data)
+        else:
+            user.nombre = validated_data['nombre']        
         user.password_hash = make_password(password)
         user.is_registered = True
         user.save()
@@ -83,7 +96,7 @@ class TokenObtainPairSerializerCustom(serializers.Serializer):
             raise serializers.ValidationError("Email y password requeridos")
         
         try:
-            user = Usuario.objects.get(email=email, is_registered=True)
+            user = Usuario.objects.get(email=email.lower(), is_registered=True)
         except Usuario.DoesNotExist:
             raise serializers.ValidationError("Email o contraseña incorrectos")
         
@@ -99,11 +112,11 @@ class TokenObtainPairSerializerCustom(serializers.Serializer):
         refresh['nombre'] = user.nombre
         refresh['user_id'] = user.id
         
-        attrs['refresh'] = str(refresh)
-        attrs['access'] = str(refresh.access_token)
-        attrs['user'] = UsuarioSerializer(user).data
-        
-        return attrs
+        return {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'user': UsuarioSerializer(user).data,
+        }
 
 # ============================================================================
 # CANCHA
@@ -184,6 +197,13 @@ class ParticipacionPartidoSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
+class ParticipacionPartidoPublicaSerializer(ParticipacionPartidoSerializer):
+    """Participación sin datos de contacto, para vistas públicas"""
+    class Meta(ParticipacionPartidoSerializer.Meta):
+        fields = ['id', 'usuario_nombre', 'estado', 'equipo_asignado']
+        read_only_fields = fields
+
+
 class ParticipacionPartidoCrearSerializer(serializers.ModelSerializer):
     """Serializer simplificado para crear/actualizar participación"""
     class Meta:
@@ -200,11 +220,12 @@ class PartidoListSerializer(serializers.ModelSerializer):
     cancha_nombre = serializers.CharField(source='cancha.nombre', read_only=True)
     participantes_count = serializers.SerializerMethodField()
     cupo_disponible = serializers.SerializerMethodField()
+    invitacion = InvitacionSerializer(read_only=True)
 
     class Meta:
         model = Partido
         fields = ['id', 'fecha_hora', 'organizador', 'organizador_nombre',
-                  'cancha', 'cancha_nombre', 'cupo_total', 'periodicidad',
+                  'cancha', 'cancha_nombre', 'cupo_total', 'invitacion', 'periodicidad',
                   'equipos_definidos', 'participantes_count', 'cupo_disponible',
                   'created_at']
         read_only_fields = fields
@@ -246,6 +267,39 @@ class PartidoDetailSerializer(serializers.ModelSerializer):
         return obj.participaciones.filter(estado='en_espera').count()
 
 
+class PartidoPublicoSerializer(PartidoDetailSerializer):
+    """Detalle de partido para quien llega por código de invitación (sin emails)"""
+    participantes = ParticipacionPartidoPublicaSerializer(
+        source='participaciones', many=True, read_only=True
+    )
+
+
+class PartidoEditarSerializer(serializers.ModelSerializer):
+    """Serializer para que el organizador edite fecha, cancha y cupo"""
+    class Meta:
+        model = Partido
+        fields = ['cancha', 'fecha_hora', 'cupo_total']
+
+    def validate_cancha(self, value):
+        if value != self.instance.cancha and not value.activa:
+            raise serializers.ValidationError("Esta cancha ya no está disponible.")
+        return value
+
+    def validate_cupo_total(self, value):
+        """El nuevo cupo no puede dejar sin lugar a jugadores activos de un equipo"""
+        cupo_equipo = value // 2
+        for equipo in ('A', 'B'):
+            activos = self.instance.participaciones.filter(
+                estado='activo', equipo_asignado=equipo
+            ).count()
+            if activos > cupo_equipo:
+                raise serializers.ValidationError(
+                    f"El equipo {equipo} ya tiene {activos} jugadores activos "
+                    f"y el nuevo cupo admite {cupo_equipo} por equipo."
+                )
+        return value
+
+
 class PartidoCrearSerializer(serializers.ModelSerializer):
     """Serializer para crear nuevo partido"""
     invitacion = InvitacionSerializer(read_only=True)
@@ -254,6 +308,11 @@ class PartidoCrearSerializer(serializers.ModelSerializer):
         model = Partido
         fields = ['cancha', 'fecha_hora', 'cupo_total', 'invitacion', 'periodicidad']
         read_only_fields = ['invitacion']
+
+    def validate_cancha(self, value):
+        if not value.activa:
+            raise serializers.ValidationError("Esta cancha ya no está disponible.")
+        return value
         
     def create(self, validated_data):
         validated_data['organizador'] = self.context['request'].user

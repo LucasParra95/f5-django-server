@@ -41,6 +41,10 @@ class Usuario(models.Model):
             models.Index(fields=['email']),
         ]
 
+    def save(self, *args, **kwargs):
+        self.email = self.email.lower()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         estado = "Registrado" if self.is_registered else "Fantasma"
         return f"{self.nombre} ({self.email}) - {estado}"
@@ -60,6 +64,11 @@ class Cancha(models.Model):
     provincia = models.CharField(max_length=150)
     telefono = models.CharField(max_length=20, null=True, blank=True)
     sitio_web = models.URLField(null=True, blank=True)
+    activa = models.BooleanField(default=True)
+    creado_por = models.ForeignKey(
+        Usuario, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='canchas_creadas'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -131,7 +140,7 @@ class Partido(models.Model):
 
     id = models.AutoField(primary_key=True)
     organizador = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='partidos_creados')
-    cancha = models.ForeignKey(Cancha, on_delete=models.SET_NULL, null=True, blank=True)
+    cancha = models.ForeignKey(Cancha, on_delete=models.PROTECT)
     fecha_hora = models.DateTimeField()
     cupo_total = models.IntegerField(validators=[MinValueValidator(4)])  # Mínimo 4 jugadores
     periodicidad = models.CharField(max_length=20, choices=PERIODICIDAD_CHOICES, default='unico')
@@ -175,7 +184,7 @@ class Partido(models.Model):
         return total_participantes < limite_espera
 
     def __str__(self):
-        return f"Partido {self.fecha_hora.strftime('%d/%m/%Y %H:%M')} - {self.cancha.nombre if self.cancha else 'Sin cancha'}"
+        return f"Partido {self.fecha_hora.strftime('%d/%m/%Y %H:%M')} - {self.cancha.nombre}"
 
 
 # ============================================================================
@@ -296,22 +305,19 @@ class EstadisticasPartido(models.Model):
 # NOTIFICACIÓN
 # ============================================================================
 class Notificacion(models.Model):
-    """
-    Modelo de Notificaciones. Se generan cuando hay eventos importantes.
-    Ej: cambio de equipo, cancelación, etc.
-    """
-    TIPO_CHOICES = [
-        ('cambio_equipo', 'Cambio de Equipo'),
-        ('cancelacion_invitacion', 'Cancelación de Invitación'),
-        ('resultado_cargado', 'Resultado Cargado'),
-        ('baneado', 'Has sido baneado'),
-        ('otro', 'Otro'),
-    ]
+    class Tipo(models.TextChoices):
+        PARTIDO_MODIFICADO = 'partido_modificado', 'Partido modificado'
+        PARTIDO_CANCELADO = 'partido_cancelado', 'Partido cancelado'
+        RESULTADO_CARGADO = 'resultado_cargado', 'Resultado cargado'
+        PARTICIPANTE_NUEVO = 'participante_nuevo', 'Nuevo participante'
+        CAMBIO_EQUIPO = 'cambio_equipo', 'Cambio de equipo'
+        BANEADO = 'baneado', 'Has sido baneado'
+        OTRO = 'otro', 'Otro'
 
     id = models.AutoField(primary_key=True)
     usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='notificaciones')
     partido = models.ForeignKey(Partido, on_delete=models.CASCADE, related_name='notificaciones')
-    tipo = models.CharField(max_length=50, choices=TIPO_CHOICES)
+    tipo = models.CharField(max_length=50, choices=Tipo.choices)
     mensaje = models.TextField()
     leida = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

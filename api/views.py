@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, generics, permissions
+from rest_framework import viewsets, mixins, status, generics, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,13 +8,15 @@ from api.models import (
     Resultado, EstadisticasPartido, Notificacion
 )
 from api.serializers import (
-    UsuarioSerializer, UsuarioRegistroSerializer, UsuarioPerfilSerializer,
+    UsuarioRegistroSerializer, UsuarioPerfilSerializer,
     CanchaSerializer, PartidoListSerializer,
-    PartidoDetailSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
+    PartidoDetailSerializer, PartidoPublicoSerializer, PartidoEditarSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
 from django.db.models import Q
-
+from django.db import transaction
+from django.utils import timezone
+from api.services.notifications import notificar_participantes
 # ============================================================================
 # PERMISOS PERSONALIZADOS
 # ============================================================================
@@ -54,15 +56,11 @@ class RegistroView(generics.CreateAPIView):
 # ============================================================================
 # USUARIO
 # ============================================================================
-class UsuarioViewSet(viewsets.ModelViewSet):
-    """ViewSet para gestionar usuarios"""
+class UsuarioViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    """ViewSet de solo lectura: perfil por id y perfil propio (me)"""
     queryset = Usuario.objects.all()
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
-
-    def get_serializer_class(self):
-        if self.action == 'retrieve':
-            return UsuarioPerfilSerializer
-        return UsuarioSerializer
+    serializer_class = UsuarioPerfilSerializer
+    permission_classes = [EsUsuarioAutenticado]
 
     @action(detail=False, methods=['get'], permission_classes=[EsUsuarioAutenticado])
     def me(self, request):
@@ -70,54 +68,19 @@ class UsuarioViewSet(viewsets.ModelViewSet):
         serializer = UsuarioPerfilSerializer(request.user)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
-    def vincular_fantasma(self, request, pk=None):
-        """
-        Vincular un usuario fantasma a usuario registrado.
-        Busca por email si hay un usuario sin registrar, lo vincula.
-        """
-        usuario_registrado = self.get_object()
-        
-        if not usuario_registrado.is_registered:
-            return Response(
-                {"error": "El usuario debe estar registrado"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Buscar usuario fantasma con mismo email
-        usuario_fantasma = Usuario.objects.filter(
-            email=usuario_registrado.email,
-            is_registered=False
-        ).first()
-
-        if not usuario_fantasma:
-            return Response(
-                {"error": "No hay usuario fantasma con este email"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Reasignar todas las participaciones al usuario registrado
-        ParticipacionPartido.objects.filter(usuario=usuario_fantasma).update(
-            usuario=usuario_registrado
-        )
-
-        usuario_fantasma.delete()
-
-        return Response(
-            {"mensaje": "Participaciones vinculadas correctamente"},
-            status=status.HTTP_200_OK
-        )
-
 
 # ============================================================================
 # CANCHA
 # ============================================================================
 class CanchaViewSet(viewsets.ModelViewSet):
     """ViewSet para gestionar canchas"""
-    queryset = Cancha.objects.all()
+    queryset = Cancha.objects.filter(activa=True)
     serializer_class = CanchaSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    http_method_names = ['get', 'post', 'head', 'options']
 
+    def perform_create(self, serializer):
+        serializer.save(creado_por=self.request.user)
 
 # ============================================================================
 # PARTIDO
@@ -125,6 +88,8 @@ class CanchaViewSet(viewsets.ModelViewSet):
 class PartidoViewSet(viewsets.ModelViewSet):
     """ViewSet principal para partidos"""
     permission_classes = [permissions.AllowAny]
+    # Sin DELETE: la baja de un partido será lógica (pendiente)
+    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
     filterset_fields = ['organizador', 'cancha', 'periodicidad']
     ordering_fields = ['fecha_hora', 'created_at']
     ordering = ['-fecha_hora']
@@ -145,18 +110,23 @@ class PartidoViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return PartidoCrearSerializer
+        elif self.action in ('update', 'partial_update'):
+            return PartidoEditarSerializer
         elif self.action == 'retrieve':
             return PartidoDetailSerializer
         return PartidoListSerializer
 
-    def create(self, request, *args, **kwargs):
-        """Crear nuevo partido (solo usuarios registrados)"""
-        if not request.user.is_registered:
-            return Response(
-                {"error": "Solo usuarios registrados pueden crear partidos"},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        return super().create(request, *args, **kwargs)
+    def get_permissions(self):
+        """Solo usuarios registrados pueden crear partidos"""
+        """
+        - create: solo usuarios registrados
+        - update/partial_update: solo el organizador (EsOrganizador se evalúa en get_object)
+        """
+        if self.action == 'create':
+            return [EsUsuarioAutenticado()]
+        if self.action in ('update', 'partial_update'):
+            return [EsUsuarioAutenticado(), EsOrganizador()]
+        return super().get_permissions()
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def cambiar_equipo(self, request, pk=None):
@@ -206,7 +176,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
             Notificacion.objects.create(
                 usuario=participacion.usuario,
                 partido=partido,
-                tipo='cambio_equipo',
+                tipo=Notificacion.Tipo.CAMBIO_EQUIPO,
                 mensaje=f"Tu equipo ha sido cambiado a Equipo {nuevo_equipo}"
             )
 
@@ -236,7 +206,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
         Notificacion.objects.create(
             usuario=participacion.usuario,
             partido=partido,
-            tipo='baneado',
+            tipo=Notificacion.Tipo.BANEADO,
             mensaje=f"Has sido baneado del partido del {partido.fecha_hora.strftime('%d/%m/%Y')}"
         )
 
@@ -282,11 +252,43 @@ class PartidoViewSet(viewsets.ModelViewSet):
         serializer = PartidoDetailSerializer(partido)
         return Response(serializer.data)
 
+    def perform_update(self, serializer):
+        partido_anterior = serializer.instance
+        horario_anterior = partido_anterior.fecha_hora
+        cancha_anterior = partido_anterior.cancha
+        cupo_anterior = partido_anterior.cupo_total
+
+        partido = serializer.save()
+
+        cambios = []
+
+        if horario_anterior != partido.fecha_hora:
+            anterior = timezone.localtime(horario_anterior)
+            nuevo = timezone.localtime(partido.fecha_hora)
+            cambios.append(
+                f"horario de {anterior:%d/%m %H:%M} a {nuevo:%d/%m %H:%M}"
+            )
+
+        if cancha_anterior != partido.cancha:
+            cambios.append(f"cancha de {cancha_anterior.nombre} a {partido.cancha.nombre}")
+
+        if cupo_anterior != partido.cupo_total:
+            cambios.append(
+                f"cupo de {cupo_anterior} a {partido.cupo_total} jugadores"
+            )
+
+        if cambios:
+            notificar_participantes(
+                partido,
+                tipo=Notificacion.Tipo.PARTIDO_MODIFICADO,
+                mensaje=f"Se modificó el partido: {'; '.join(cambios)}",
+                excluir_usuario=self.request.user,
+            )
 
 # ============================================================================
 # RESULTADO Y ESTADÍSTICAS
 # ============================================================================
-class ResultadoViewSet(viewsets.ModelViewSet):
+class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet para resultados de partidos"""
     queryset = Resultado.objects.all()
     serializer_class = ResultadoSerializer
@@ -348,39 +350,43 @@ class ResultadoViewSet(viewsets.ModelViewSet):
             )
 
         # Crear resultado
-        resultado = Resultado.objects.create(
-            partido=partido,
-            equipo_a_goles=equipo_a_goles,
-            equipo_b_goles=equipo_b_goles,
-            cargado_por=request.user
-        )
+        fecha = timezone.localtime(partido.fecha_hora)
 
-        # Crear estadísticas por jugador
-        for stat in estadisticas_data:
-            usuario_id = stat.get('usuario_id')
-            usuario = get_object_or_404(Usuario, id=usuario_id)
-
-            EstadisticasPartido.objects.create(
-                resultado=resultado,
-                usuario=usuario,
-                goles=stat.get('goles'),
-                tarjetas_amarillas=stat.get('amarillas'),
-                tarjetas_rojas=stat.get('rojas')
-            )
-
-        # Crear notificaciones
-        participantes = ParticipacionPartido.objects.filter(
-            partido=partido,
-            usuario__is_registered=True
-        ).values_list('usuario_id', flat=True)
-
-        for usuario_id in participantes:
-            Notificacion.objects.create(
-                usuario_id=usuario_id,
+        with transaction.atomic():
+            # Crear resultado
+            resultado = Resultado.objects.create(
                 partido=partido,
-                tipo='resultado_cargado',
-                mensaje=f"El resultado del partido ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                equipo_a_goles=equipo_a_goles,
+                equipo_b_goles=equipo_b_goles,
+                cargado_por=request.user
             )
+
+            # Crear estadísticas por jugador
+            for stat in estadisticas_data:
+                usuario_id = stat.get('usuario_id')
+                usuario = get_object_or_404(Usuario, id=usuario_id)
+
+                EstadisticasPartido.objects.create(
+                    resultado=resultado,
+                    usuario=usuario,
+                    goles=stat.get('goles'),
+                    tarjetas_amarillas=stat.get('amarillas'),
+                    tarjetas_rojas=stat.get('rojas')
+                )
+
+            # Crear notificaciones
+            participantes = ParticipacionPartido.objects.filter(
+                partido=partido,
+                usuario__is_registered=True
+            ).values_list('usuario_id', flat=True)
+
+            for usuario_id in participantes:
+                Notificacion.objects.create(
+                    usuario_id=usuario_id,
+                    partido=partido,
+                    tipo=Notificacion.Tipo.RESULTADO_CARGADO,
+                    mensaje=f"El resultado del partido del día {fecha:%d/%m/%Y} ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                )
 
         serializer = ResultadoSerializer(resultado)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -404,8 +410,7 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
         notificacion = self.get_object()
         notificacion.leida = True
         notificacion.save()
-        serializer = self.get_serializer(notificacion)
-        return Response(serializer.data)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=['patch'])
     def marcar_todas_leidas(self, request):
@@ -414,7 +419,7 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
             usuario=request.user,
             leida=False
         ).update(leida=True)
-        return Response({"mensaje": "Todas las notificaciones marcadas como leídas"})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ============================================================================
@@ -434,7 +439,7 @@ class InvitacionPorCodigoView(APIView):
             )
         
         partido = invitacion.partido
-        serializer = PartidoDetailSerializer(partido)
+        serializer = PartidoPublicoSerializer(partido)
         return Response({'partido': serializer.data})
 
 
@@ -447,7 +452,7 @@ class AceptarInvitacionView(APIView):
         
         codigo = request.data.get('codigo_unico')
         nombre = request.data.get('nombre')
-        email = request.data.get('email')
+        email = (request.data.get('email') or '').strip().lower()
         equipo = request.data.get('equipo', 'A')
 
         # Validar código de invitación
@@ -478,6 +483,11 @@ class AceptarInvitacionView(APIView):
                 email=email,
                 defaults={'nombre': nombre, 'is_registered': False}
             )
+            if usuario.is_registered:
+                return Response(
+                    {'error': 'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         # Verificar si ya participa
         if ParticipacionPartido.objects.filter(partido=partido, usuario=usuario).exists():
@@ -511,6 +521,13 @@ class AceptarInvitacionView(APIView):
             usuario=usuario,
             estado=estado,
             equipo_asignado=equipo
+        )
+
+        notificar_participantes(
+            partido,
+            tipo=Notificacion.Tipo.PARTICIPANTE_NUEVO,
+            mensaje=f"Se unió un nuevo participante al partido: {usuario.nombre} (Equipo {equipo})",
+            excluir_usuario=self.request.user,
         )
 
         serializer = ParticipacionPartidoSerializer(participacion)
