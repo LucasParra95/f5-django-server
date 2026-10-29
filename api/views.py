@@ -74,7 +74,7 @@ class UsuarioViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
 # ============================================================================
 class CanchaViewSet(viewsets.ModelViewSet):
     """ViewSet para gestionar canchas"""
-    queryset = Cancha.objects.all()
+    queryset = Cancha.objects.filter(activa=True)
     serializer_class = CanchaSerializer
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
     http_method_names = ['get', 'post', 'head', 'options']

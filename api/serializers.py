@@ -280,6 +280,11 @@ class PartidoEditarSerializer(serializers.ModelSerializer):
         model = Partido
         fields = ['cancha', 'fecha_hora', 'cupo_total']
 
+    def validate_cancha(self, value):
+        if value != self.instance.cancha and not value.activa:
+            raise serializers.ValidationError("Esta cancha ya no está disponible.")
+        return value
+
     def validate_cupo_total(self, value):
         """El nuevo cupo no puede dejar sin lugar a jugadores activos de un equipo"""
         cupo_equipo = value // 2
@@ -303,6 +308,11 @@ class PartidoCrearSerializer(serializers.ModelSerializer):
         model = Partido
         fields = ['cancha', 'fecha_hora', 'cupo_total', 'invitacion', 'periodicidad']
         read_only_fields = ['invitacion']
+
+    def validate_cancha(self, value):
+        if not value.activa:
+            raise serializers.ValidationError("Esta cancha ya no está disponible.")
+        return value
         
     def create(self, validated_data):
         validated_data['organizador'] = self.context['request'].user
