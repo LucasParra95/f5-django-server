@@ -30,6 +30,7 @@ class UsuarioRegistroSerializer(serializers.ModelSerializer):
         extra_kwargs = {'email': {'validators': []}}
 
     def validate_email(self, value):
+        value = value.strip().lower()
         if Usuario.objects.filter(email=value, is_registered=True).exists():
             raise serializers.ValidationError("Ya existe una cuenta con este email.")
         return value
@@ -200,7 +201,7 @@ class ParticipacionPartidoSerializer(serializers.ModelSerializer):
 class ParticipacionPartidoPublicaSerializer(ParticipacionPartidoSerializer):
     """Participación sin datos de contacto, para vistas públicas"""
     class Meta(ParticipacionPartidoSerializer.Meta):
-        fields = ['id', 'usuario_nombre', 'estado', 'equipo_asignado']
+        fields = ['id', 'usuario', 'usuario_nombre', 'estado', 'equipo_asignado']
         read_only_fields = fields
 
 

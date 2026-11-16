@@ -104,7 +104,8 @@ class PartidoViewSet(viewsets.ModelViewSet):
         # Solo partidos donde el usuario es organizador O participa
         return Partido.objects.filter(
             Q(organizador=user) | 
-            Q(participaciones__usuario=user)
+            Q(participaciones__usuario=user,
+              participaciones__estado__in=['activo', 'en_espera'])
         ).distinct().order_by('-fecha_hora')
 
     def get_serializer_class(self):
@@ -112,8 +113,6 @@ class PartidoViewSet(viewsets.ModelViewSet):
             return PartidoCrearSerializer
         elif self.action in ('update', 'partial_update'):
             return PartidoEditarSerializer
-        elif self.action == 'retrieve':
-            return PartidoDetailSerializer
         return PartidoListSerializer
 
     def get_permissions(self):
@@ -127,6 +126,16 @@ class PartidoViewSet(viewsets.ModelViewSet):
         if self.action in ('update', 'partial_update'):
             return [EsUsuarioAutenticado(), EsOrganizador()]
         return super().get_permissions()
+
+    def retrieve(self, request, *args, **kwargs):
+        partido = self.get_object()
+        serializer_class = (
+            PartidoDetailSerializer
+            if partido.organizador_id == request.user.id
+            else PartidoPublicoSerializer
+        )
+        serializer = serializer_class(partido, context=self.get_serializer_context())
+        return Response(serializer.data)
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def cambiar_equipo(self, request, pk=None):
@@ -527,7 +536,7 @@ class AceptarInvitacionView(APIView):
             partido,
             tipo=Notificacion.Tipo.PARTICIPANTE_NUEVO,
             mensaje=f"Se unió un nuevo participante al partido: {usuario.nombre} (Equipo {equipo})",
-            excluir_usuario=self.request.user,
+            excluir_usuario=usuario,
         )
 
         serializer = ParticipacionPartidoSerializer(participacion)
