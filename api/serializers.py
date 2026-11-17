@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.hashers import make_password
+from django.utils import timezone
 from api.models import (
     Usuario, Cancha, Invitacion, Partido, ParticipacionPartido,
     Resultado, EstadisticasPartido, Notificacion
@@ -83,6 +84,10 @@ class UsuarioPerfilSerializer(serializers.ModelSerializer):
                 total += stat.goles
         return total
 
+class UsuarioActualizarSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Usuario
+        fields = ['nombre']
 
 class TokenObtainPairSerializerCustom(serializers.Serializer):
     """Serializer personalizado para login con email"""
@@ -280,6 +285,19 @@ class PartidoEditarSerializer(serializers.ModelSerializer):
     class Meta:
         model = Partido
         fields = ['cancha', 'fecha_hora', 'cupo_total']
+
+    def validate(self, attrs):
+        partido = self.instance
+        if hasattr(partido, 'resultado'):
+            raise serializers.ValidationError("No se puede editar un partido con resultado cargado.")
+        if partido.fecha_hora <= timezone.now():
+            raise serializers.ValidationError("No se puede editar un partido que ya se jugó.")
+        return attrs
+
+    def validate_fecha_hora(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError("La nueva fecha debe ser futura.")
+        return value
 
     def validate_cancha(self, value):
         if value != self.instance.cancha and not value.activa:
