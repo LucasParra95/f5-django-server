@@ -1,14 +1,15 @@
-from rest_framework import viewsets, mixins, status, generics, permissions
+from rest_framework import viewsets, status, generics, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
 from api.models import (
     Usuario, Cancha, Invitacion, Partido, ParticipacionPartido,
     Resultado, EstadisticasPartido, Notificacion
 )
 from api.serializers import (
-    UsuarioRegistroSerializer, UsuarioPerfilSerializer,
+    UsuarioRegistroSerializer, UsuarioPerfilSerializer, UsuarioActualizarSerializer,
     CanchaSerializer, PartidoListSerializer,
     PartidoDetailSerializer, PartidoPublicoSerializer, PartidoEditarSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
     NotificacionSerializer, TokenObtainPairSerializerCustom
@@ -39,6 +40,8 @@ class TokenObtainPairViewCustom(generics.GenericAPIView):
     """Vista personalizada de token por email"""
     serializer_class = TokenObtainPairSerializerCustom
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth'
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -51,23 +54,27 @@ class RegistroView(generics.CreateAPIView):
     queryset = Usuario.objects.all()
     serializer_class = UsuarioRegistroSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth'
 
 
 # ============================================================================
 # USUARIO
 # ============================================================================
-class UsuarioViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+class UsuarioViewSet(viewsets.GenericViewSet):
     """ViewSet de solo lectura: perfil por id y perfil propio (me)"""
     queryset = Usuario.objects.all()
     serializer_class = UsuarioPerfilSerializer
     permission_classes = [EsUsuarioAutenticado]
 
-    @action(detail=False, methods=['get'], permission_classes=[EsUsuarioAutenticado])
+    @action(detail=False, methods=['get', 'put', 'patch'], permission_classes=[EsUsuarioAutenticado])
     def me(self, request):
-        """Obtener perfil del usuario autenticado"""
-        serializer = UsuarioPerfilSerializer(request.user)
-        return Response(serializer.data)
-
+        if request.method == 'GET':
+            return Response(UsuarioPerfilSerializer(request.user).data)
+        serializer = UsuarioActualizarSerializer(request.user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UsuarioPerfilSerializer(request.user).data)
 
 # ============================================================================
 # CANCHA
@@ -104,7 +111,8 @@ class PartidoViewSet(viewsets.ModelViewSet):
         # Solo partidos donde el usuario es organizador O participa
         return Partido.objects.filter(
             Q(organizador=user) | 
-            Q(participaciones__usuario=user)
+            Q(participaciones__usuario=user,
+              participaciones__estado__in=['activo', 'en_espera'])
         ).distinct().order_by('-fecha_hora')
 
     def get_serializer_class(self):
@@ -112,8 +120,6 @@ class PartidoViewSet(viewsets.ModelViewSet):
             return PartidoCrearSerializer
         elif self.action in ('update', 'partial_update'):
             return PartidoEditarSerializer
-        elif self.action == 'retrieve':
-            return PartidoDetailSerializer
         return PartidoListSerializer
 
     def get_permissions(self):
@@ -127,6 +133,16 @@ class PartidoViewSet(viewsets.ModelViewSet):
         if self.action in ('update', 'partial_update'):
             return [EsUsuarioAutenticado(), EsOrganizador()]
         return super().get_permissions()
+
+    def retrieve(self, request, *args, **kwargs):
+        partido = self.get_object()
+        serializer_class = (
+            PartidoDetailSerializer
+            if partido.organizador_id == request.user.id
+            else PartidoPublicoSerializer
+        )
+        serializer = serializer_class(partido, context=self.get_serializer_context())
+        return Response(serializer.data)
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def cambiar_equipo(self, request, pk=None):
@@ -213,7 +229,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
         serializer = ParticipacionPartidoSerializer(participacion)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.AllowAny])
+    @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def definir_equipos(self, request, pk=None):
         """
         Definir equipos del partido (solo organizador).
@@ -227,64 +243,62 @@ class PartidoViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        equipos_data = request.data.get('equipos', {})
-        
-        if not equipos_data.get('A') or not equipos_data.get('B'):
+        if hasattr(partido, 'resultado'):
+            return Response(
+                {"error": "El partido ya tiene resultado cargado"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        equipos_data = request.data.get('equipos')
+        if not isinstance(equipos_data, dict) or set(equipos_data.keys()) != {'A', 'B'}:
+            return Response(
+                {"error": "Debes enviar exactamente los equipos 'A' y 'B'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not equipos_data['A'] or not equipos_data['B']:
             return Response(
                 {"error": "Debes especificar usuarios para ambos equipos"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Actualizar asignaciones
-        for equipo, usuario_ids in equipos_data.items():
-            for usuario_id in usuario_ids:
-                participacion = get_object_or_404(
-                    ParticipacionPartido,
-                    partido=partido,
-                    usuario_id=usuario_id
+        try:
+            asignaciones = {
+                equipo: [int(uid) for uid in ids]
+                for equipo, ids in equipos_data.items()
+            }
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Los ids de jugadores son inválidos"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        todos = asignaciones['A'] + asignaciones['B']
+        if len(todos) != len(set(todos)):
+            return Response(
+                {"error": "Un jugador no puede estar en ambos equipos ni repetido"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic():
+            activos = set(
+                partido.participaciones.select_for_update()
+                .filter(estado='activo')
+                .values_list('usuario_id', flat=True)
+            )
+            if not set(todos).issubset(activos):
+                return Response(
+                    {"error": "Hay jugadores que no participan activamente del partido"},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
-                participacion.equipo_asignado = equipo
-                participacion.save()
 
-        partido.equipos_definidos = True
-        partido.save()
+            for equipo, ids in asignaciones.items():
+                partido.participaciones.filter(usuario_id__in=ids).update(equipo_asignado=equipo)
 
-        serializer = PartidoDetailSerializer(partido)
-        return Response(serializer.data)
+            partido.equipos_definidos = True
+            partido.save(update_fields=['equipos_definidos', 'updated_at'])
 
-    def perform_update(self, serializer):
-        partido_anterior = serializer.instance
-        horario_anterior = partido_anterior.fecha_hora
-        cancha_anterior = partido_anterior.cancha
-        cupo_anterior = partido_anterior.cupo_total
-
-        partido = serializer.save()
-
-        cambios = []
-
-        if horario_anterior != partido.fecha_hora:
-            anterior = timezone.localtime(horario_anterior)
-            nuevo = timezone.localtime(partido.fecha_hora)
-            cambios.append(
-                f"horario de {anterior:%d/%m %H:%M} a {nuevo:%d/%m %H:%M}"
-            )
-
-        if cancha_anterior != partido.cancha:
-            cambios.append(f"cancha de {cancha_anterior.nombre} a {partido.cancha.nombre}")
-
-        if cupo_anterior != partido.cupo_total:
-            cambios.append(
-                f"cupo de {cupo_anterior} a {partido.cupo_total} jugadores"
-            )
-
-        if cambios:
-            notificar_participantes(
-                partido,
-                tipo=Notificacion.Tipo.PARTIDO_MODIFICADO,
-                mensaje=f"Se modificó el partido: {'; '.join(cambios)}",
-                excluir_usuario=self.request.user,
-            )
-
+        return Response(PartidoDetailSerializer(partido).data)
 # ============================================================================
 # RESULTADO Y ESTADÍSTICAS
 # ============================================================================
@@ -325,35 +339,79 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
         equipo_b_goles = request.data.get('equipo_b_goles')
         estadisticas_data = request.data.get('estadisticas', [])
 
-        # Obtener partido
+        def error(msg):
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        def entero_no_negativo(valor):
+            return isinstance(valor, int) and not isinstance(valor, bool) and valor >= 0
+
         partido = get_object_or_404(Partido, id=partido_id)
 
-        # Verificar permisos
         if partido.organizador != request.user:
             return Response(
                 {"error": "Solo el organizador puede cargar resultado"},
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Verificar equipos definidos
         if not partido.equipos_definidos:
-            return Response(
-                {"error": "Los equipos deben estar definidos antes de cargar resultado"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return error("Los equipos deben estar definidos antes de cargar resultado")
 
-        # Verificar que no existe resultado
-        if Resultado.objects.filter(partido=partido).exists():
-            return Response(
-                {"error": "Este partido ya tiene resultado cargado"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if partido.fecha_hora > timezone.now():
+            return error("El partido todavía no se jugó")
 
-        # Crear resultado
+        if not entero_no_negativo(equipo_a_goles) or not entero_no_negativo(equipo_b_goles):
+            return error("Goles inválidos")
+
+        if not isinstance(estadisticas_data, list):
+            return error("Estadísticas inválidas")
+
+        # Jugadores activos y su equipo
+        equipo_de = dict(
+            partido.participaciones.filter(estado='activo')
+            .values_list('usuario_id', 'equipo_asignado')
+        )
+
+        estadisticas = []
+        vistos = set()
+        goles_por_equipo = {'A': 0, 'B': 0}
+
+        for stat in estadisticas_data:
+            try:
+                uid = int(stat.get('usuario_id'))
+            except (TypeError, ValueError, AttributeError):
+                return error("Estadística con jugador inválido")
+
+            if uid not in equipo_de:
+                return error("Hay estadísticas de un jugador que no participa del partido")
+            if uid in vistos:
+                return error("Hay estadísticas duplicadas para un jugador")
+            vistos.add(uid)
+
+            goles = stat.get('goles')
+            amarillas = stat.get('amarillas')
+            rojas = stat.get('rojas')
+
+            if any(v is not None and not entero_no_negativo(v) for v in (goles, amarillas, rojas)):
+                return error("Las estadísticas deben ser enteros mayores o iguales a 0")
+            if (amarillas or 0) > 2 or (rojas or 0) > 1:
+                return error("Tarjetas fuera de rango")
+
+            if equipo_de[uid] in goles_por_equipo:
+                goles_por_equipo[equipo_de[uid]] += goles or 0
+
+            estadisticas.append((uid, goles, amarillas, rojas))
+
+        if goles_por_equipo['A'] > equipo_a_goles or goles_por_equipo['B'] > equipo_b_goles:
+            return error("La suma de goles individuales supera los goles del equipo")
+
         fecha = timezone.localtime(partido.fecha_hora)
 
         with transaction.atomic():
-            # Crear resultado
+            # Bloquea el partido y reconfirma que no haya resultado (evita doble carga)
+            Partido.objects.select_for_update().get(pk=partido.pk)
+            if Resultado.objects.filter(partido=partido).exists():
+                return error("Este partido ya tiene resultado cargado")
+
             resultado = Resultado.objects.create(
                 partido=partido,
                 equipo_a_goles=equipo_a_goles,
@@ -361,35 +419,36 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
                 cargado_por=request.user
             )
 
-            # Crear estadísticas por jugador
-            for stat in estadisticas_data:
-                usuario_id = stat.get('usuario_id')
-                usuario = get_object_or_404(Usuario, id=usuario_id)
-
-                EstadisticasPartido.objects.create(
+            EstadisticasPartido.objects.bulk_create([
+                EstadisticasPartido(
                     resultado=resultado,
-                    usuario=usuario,
-                    goles=stat.get('goles'),
-                    tarjetas_amarillas=stat.get('amarillas'),
-                    tarjetas_rojas=stat.get('rojas')
+                    usuario_id=uid,
+                    goles=goles,
+                    tarjetas_amarillas=amarillas,
+                    tarjetas_rojas=rojas,
                 )
+                for uid, goles, amarillas, rojas in estadisticas
+            ])
 
-            # Crear notificaciones
-            participantes = ParticipacionPartido.objects.filter(
-                partido=partido,
+            destinatarios = partido.participaciones.filter(
+                estado='activo',
                 usuario__is_registered=True
             ).values_list('usuario_id', flat=True)
 
-            for usuario_id in participantes:
-                Notificacion.objects.create(
-                    usuario_id=usuario_id,
+            Notificacion.objects.bulk_create([
+                Notificacion(
+                    usuario_id=uid,
                     partido=partido,
                     tipo=Notificacion.Tipo.RESULTADO_CARGADO,
-                    mensaje=f"El resultado del partido del día {fecha:%d/%m/%Y} ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                    mensaje=(
+                        f"El resultado del partido del día {fecha:%d/%m/%Y} "
+                        f"ha sido cargado: {equipo_a_goles} - {equipo_b_goles}"
+                    ),
                 )
+                for uid in destinatarios
+            ])
 
-        serializer = ResultadoSerializer(resultado)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(ResultadoSerializer(resultado).data, status=status.HTTP_201_CREATED)
 
 
 # ============================================================================
@@ -446,6 +505,8 @@ class InvitacionPorCodigoView(APIView):
 class AceptarInvitacionView(APIView):
     """Aceptar invitación sin estar autenticado"""
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'invitacion'
     
     def post(self, request, partido_id):
         partido = get_object_or_404(Partido, id=partido_id)
@@ -469,66 +530,69 @@ class AceptarInvitacionView(APIView):
                 {'error': 'La invitación ha expirado o fue cancelada'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        with transaction.atomic():
+            # Bloquea la fila del partido: otro request simultáneo espera acá
+            partido = Partido.objects.select_for_update().get(pk=partido.pk)
 
-        # Obtener o crear usuario
-        if request.user.is_authenticated:
-            usuario = request.user
-        else:
-            if not nombre or not email:
+            # Obtener o crear usuario
+            if request.user.is_authenticated:
+                usuario = request.user
+            else:
+                if not nombre or not email:
+                    return Response(
+                        {'error': 'Nombre y email requeridos'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                usuario, created = Usuario.objects.get_or_create(
+                    email=email,
+                    defaults={'nombre': nombre, 'is_registered': False}
+                )
+                if usuario.is_registered:
+                    return Response(
+                        {'error': 'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+            # Verificar si ya participa
+            if ParticipacionPartido.objects.filter(partido=partido, usuario=usuario).exists():
                 return Response(
-                    {'error': 'Nombre y email requeridos'},
+                    {'error': 'Ya estás registrado en este partido'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            usuario, created = Usuario.objects.get_or_create(
-                email=email,
-                defaults={'nombre': nombre, 'is_registered': False}
-            )
-            if usuario.is_registered:
+
+            # Validar equipo
+            if equipo not in ['A', 'B']:
                 return Response(
-                    {'error': 'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.'},
-                    status=status.HTTP_403_FORBIDDEN
+                    {'error': "Equipo debe ser 'A' o 'B'"},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Verificar si ya participa
-        if ParticipacionPartido.objects.filter(partido=partido, usuario=usuario).exists():
-            return Response(
-                {'error': 'Ya estás registrado en este partido'},
-                status=status.HTTP_400_BAD_REQUEST
+            # Validar cupo
+            cupo_disponible_equipo = partido.cupo_disponible(equipo)
+            if cupo_disponible_equipo > 0:
+                estado = 'activo'
+            elif partido.lista_espera_disponible():
+                estado = 'en_espera'
+            else:
+                return Response(
+                    {'error': 'Sin cupo disponible ni en lista de espera'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Crear participación
+            participacion = ParticipacionPartido.objects.create(
+                partido=partido,
+                usuario=usuario,
+                estado=estado,
+                equipo_asignado=equipo
             )
 
-        # Validar equipo
-        if equipo not in ['A', 'B']:
-            return Response(
-                {'error': "Equipo debe ser 'A' o 'B'"},
-                status=status.HTTP_400_BAD_REQUEST
+            notificar_participantes(
+                partido,
+                tipo=Notificacion.Tipo.PARTICIPANTE_NUEVO,
+                mensaje=f"Se unió un nuevo participante al partido: {usuario.nombre} (Equipo {equipo})",
+                excluir_usuario=usuario,
             )
-
-        # Validar cupo
-        cupo_disponible_equipo = partido.cupo_disponible(equipo)
-        if cupo_disponible_equipo > 0:
-            estado = 'activo'
-        elif partido.lista_espera_disponible():
-            estado = 'en_espera'
-        else:
-            return Response(
-                {'error': 'Sin cupo disponible ni en lista de espera'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Crear participación
-        participacion = ParticipacionPartido.objects.create(
-            partido=partido,
-            usuario=usuario,
-            estado=estado,
-            equipo_asignado=equipo
-        )
-
-        notificar_participantes(
-            partido,
-            tipo=Notificacion.Tipo.PARTICIPANTE_NUEVO,
-            mensaje=f"Se unió un nuevo participante al partido: {usuario.nombre} (Equipo {equipo})",
-            excluir_usuario=self.request.user,
-        )
 
         serializer = ParticipacionPartidoSerializer(participacion)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
