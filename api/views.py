@@ -2,6 +2,7 @@ from rest_framework import viewsets, status, generics, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
 from api.models import (
     Usuario, Cancha, Invitacion, Partido, ParticipacionPartido,
@@ -39,6 +40,8 @@ class TokenObtainPairViewCustom(generics.GenericAPIView):
     """Vista personalizada de token por email"""
     serializer_class = TokenObtainPairSerializerCustom
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth'
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -51,6 +54,8 @@ class RegistroView(generics.CreateAPIView):
     queryset = Usuario.objects.all()
     serializer_class = UsuarioRegistroSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth'
 
 
 # ============================================================================
@@ -500,6 +505,8 @@ class InvitacionPorCodigoView(APIView):
 class AceptarInvitacionView(APIView):
     """Aceptar invitación sin estar autenticado"""
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'invitacion'
     
     def post(self, request, partido_id):
         partido = get_object_or_404(Partido, id=partido_id)
