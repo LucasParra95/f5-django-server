@@ -102,7 +102,7 @@ class TokenObtainPairSerializerCustom(serializers.Serializer):
             raise serializers.ValidationError("Email y password requeridos")
         
         try:
-            user = Usuario.objects.get(email=email.lower(), is_registered=True)
+            user = Usuario.objects.get(email=email.lower(), is_registered=True, is_active=True)
         except Usuario.DoesNotExist:
             raise serializers.ValidationError("Email o contraseña incorrectos")
         
