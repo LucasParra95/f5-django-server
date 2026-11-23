@@ -142,7 +142,7 @@ class Partido(models.Model):
     organizador = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='partidos_creados')
     cancha = models.ForeignKey(Cancha, on_delete=models.PROTECT)
     fecha_hora = models.DateTimeField()
-    cupo_total = models.IntegerField(validators=[MinValueValidator(4)])  # Mínimo 4 jugadores
+    cupo_total = models.IntegerField(validators=[MinValueValidator(4), MaxValueValidator(40)])  # Mínimo 4, máximo 40 jugadores
     periodicidad = models.CharField(max_length=20, choices=PERIODICIDAD_CHOICES, default='unico')
     equipos_definidos = models.BooleanField(default=False)
     # Resultado se accede via: partido_instance.resultado (reverse relation)

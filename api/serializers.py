@@ -321,21 +321,29 @@ class PartidoEditarSerializer(serializers.ModelSerializer):
 
 class PartidoCrearSerializer(serializers.ModelSerializer):
     """Serializer para crear nuevo partido"""
-    invitacion = InvitacionSerializer(read_only=True)
 
     class Meta:
         model = Partido
-        fields = ['cancha', 'fecha_hora', 'cupo_total', 'invitacion', 'periodicidad']
-        read_only_fields = ['invitacion']
+        fields = ['cancha', 'fecha_hora', 'cupo_total', 'periodicidad']
 
     def validate_cancha(self, value):
         if not value.activa:
             raise serializers.ValidationError("Esta cancha ya no está disponible.")
         return value
-        
+
+    def validate_fecha_hora(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError("La fecha y hora deben ser futuras.")
+        return value
+
     def create(self, validated_data):
         validated_data['organizador'] = self.context['request'].user
         return super().create(validated_data)
+
+    def to_representation(self, instance):
+        # La respuesta usa el mismo formato que el listado (trae id, organizador,
+        # cancha_nombre, invitacion, etc.), así el frontend puede agregarla al estado.
+        return PartidoListSerializer(instance, context=self.context).data
 
 
 # ============================================================================
