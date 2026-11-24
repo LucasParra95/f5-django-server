@@ -468,6 +468,12 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         return Notificacion.objects.filter(usuario=self.request.user)
 
+    @action(detail=False, methods=['get'])
+    def no_leidas(self, request):
+        """Cantidad total de no leídas (el listado está paginado)"""
+        cantidad = self.get_queryset().filter(leida=False).count()
+        return Response({'count': cantidad})
+
     @action(detail=True, methods=['patch'])
     def marcar_leida(self, request, pk=None):
         """Marcar notificación como leída"""
@@ -492,7 +498,8 @@ class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
 class InvitacionPorCodigoView(APIView):
     """Obtener partido por código de invitación (solo acceso directo)"""
     permission_classes = [permissions.AllowAny]
-    
+    ignorar_token_invalido = True
+
     def get(self, request, codigo):
         invitacion = get_object_or_404(Invitacion, codigo_unico=codigo)
         
@@ -512,84 +519,76 @@ class AceptarInvitacionView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'invitacion'
-    
+    ignorar_token_invalido = True
+
     def post(self, request, partido_id):
         partido = get_object_or_404(Partido, id=partido_id)
-        
+
         codigo = request.data.get('codigo_unico')
         nombre = request.data.get('nombre')
         email = (request.data.get('email') or '').strip().lower()
         equipo = request.data.get('equipo', 'A')
 
-        # Validar código de invitación
+        def rechazar_antes(mensaje):
+            return Response({'error': mensaje}, status=status.HTTP_400_BAD_REQUEST)
+
+        def rechazar(mensaje, codigo_http=status.HTTP_400_BAD_REQUEST):
+            # Solo dentro del atomic: deshace lo creado (p. ej. el fantasma)
+            transaction.set_rollback(True)
+            return Response({'error': mensaje}, status=codigo_http)
+
+        # --- Validaciones que no necesitan transacción ---
         try:
             invitacion = Invitacion.objects.get(partido=partido, codigo_unico=codigo)
         except Invitacion.DoesNotExist:
-            return Response(
-                {'error': 'Código de invitación inválido'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return rechazar_antes('Código de invitación inválido')
 
         if not invitacion.esta_activa():
-            return Response(
-                {'error': 'La invitación ha expirado o fue cancelada'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return rechazar_antes('La invitación ha expirado o fue cancelada')
+
+        if equipo not in ('A', 'B'):
+            return rechazar_antes("Equipo debe ser 'A' o 'B'")
+
+        if hasattr(partido, 'resultado') or (
+            partido.periodicidad == 'unico' and partido.fecha_hora <= timezone.now()
+        ):
+            return rechazar_antes('El partido ya se jugó')
+
+        if not request.user.is_authenticated and (not nombre or not email):
+            return rechazar_antes('Nombre y email requeridos')
+
+        # --- Cupo y alta, con el partido bloqueado ---
         with transaction.atomic():
-            # Bloquea la fila del partido: otro request simultáneo espera acá
             partido = Partido.objects.select_for_update().get(pk=partido.pk)
 
-            # Obtener o crear usuario
             if request.user.is_authenticated:
                 usuario = request.user
             else:
-                if not nombre or not email:
-                    return Response(
-                        {'error': 'Nombre y email requeridos'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                usuario, created = Usuario.objects.get_or_create(
+                usuario, _ = Usuario.objects.get_or_create(
                     email=email,
                     defaults={'nombre': nombre, 'is_registered': False}
                 )
                 if usuario.is_registered:
-                    return Response(
-                        {'error': 'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.'},
-                        status=status.HTTP_403_FORBIDDEN
+                    return rechazar(
+                        'Este email pertenece a una cuenta registrada. Iniciá sesión para unirte.',
+                        status.HTTP_403_FORBIDDEN,
                     )
 
-            # Verificar si ya participa
             if ParticipacionPartido.objects.filter(partido=partido, usuario=usuario).exists():
-                return Response(
-                    {'error': 'Ya estás registrado en este partido'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return rechazar('Ya estás registrado en este partido')
 
-            # Validar equipo
-            if equipo not in ['A', 'B']:
-                return Response(
-                    {'error': "Equipo debe ser 'A' o 'B'"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # Validar cupo
-            cupo_disponible_equipo = partido.cupo_disponible(equipo)
-            if cupo_disponible_equipo > 0:
+            if partido.cupo_disponible(equipo) > 0:
                 estado = 'activo'
             elif partido.lista_espera_disponible():
                 estado = 'en_espera'
             else:
-                return Response(
-                    {'error': 'Sin cupo disponible ni en lista de espera'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return rechazar('Sin cupo disponible ni en lista de espera')
 
-            # Crear participación
             participacion = ParticipacionPartido.objects.create(
                 partido=partido,
                 usuario=usuario,
                 estado=estado,
-                equipo_asignado=equipo
+                equipo_asignado=equipo,
             )
 
             notificar_participantes(
@@ -599,5 +598,7 @@ class AceptarInvitacionView(APIView):
                 excluir_usuario=usuario,
             )
 
-        serializer = ParticipacionPartidoSerializer(participacion)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(
+            ParticipacionPartidoSerializer(participacion).data,
+            status=status.HTTP_201_CREATED,
+        )
