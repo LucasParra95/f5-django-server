@@ -345,6 +345,11 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
         def entero_no_negativo(valor):
             return isinstance(valor, int) and not isinstance(valor, bool) and valor >= 0
 
+        try:
+            partido_id = int(request.data.get('partido_id'))
+        except (TypeError, ValueError):
+            return error("partido_id inválido")
+
         partido = get_object_or_404(Partido, id=partido_id)
 
         if partido.organizador != request.user:
