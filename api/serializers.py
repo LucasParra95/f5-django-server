@@ -232,7 +232,7 @@ class PartidoListSerializer(serializers.ModelSerializer):
         model = Partido
         fields = ['id', 'fecha_hora', 'organizador', 'organizador_nombre',
                   'cancha', 'cancha_nombre', 'cupo_total', 'invitacion', 'periodicidad',
-                  'equipos_definidos', 'participantes_count', 'cupo_disponible',
+                  'equipos_definidos', 'estado', 'participantes_count', 'cupo_disponible',
                   'created_at']
         read_only_fields = fields
 
@@ -258,10 +258,10 @@ class PartidoDetailSerializer(serializers.ModelSerializer):
         model = Partido
         fields = ['id', 'fecha_hora', 'organizador', 'organizador_nombre',
                   'cancha', 'cancha_nombre', 'cupo_total', 'periodicidad',
-                  'equipos_definidos', 'resultado', 'invitacion',
+                  'equipos_definidos', 'estado', 'resultado', 'invitacion',
                   'participantes', 'participantes_count', 'cupo_disponible',
                   'en_espera_count', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'estado', 'created_at', 'updated_at']
 
     def get_participantes_count(self, obj):
         return obj.participaciones.filter(estado='activo').count()
@@ -288,6 +288,8 @@ class PartidoEditarSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         partido = self.instance
+        if partido.estado == Partido.Estado.CANCELADO:
+            raise serializers.ValidationError("No se puede editar un partido cancelado.")
         if hasattr(partido, 'resultado'):
             raise serializers.ValidationError("No se puede editar un partido con resultado cargado.")
         if partido.fecha_hora <= timezone.now():

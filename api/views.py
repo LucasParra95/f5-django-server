@@ -4,6 +4,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 from api.models import (
     Usuario, Cancha, Invitacion, Partido, ParticipacionPartido,
     Resultado, EstadisticasPartido, Notificacion
@@ -14,10 +17,10 @@ from api.serializers import (
     PartidoDetailSerializer, PartidoPublicoSerializer, PartidoEditarSerializer, PartidoCrearSerializer, ParticipacionPartidoSerializer, ResultadoSerializer,
     NotificacionSerializer, TokenObtainPairSerializerCustom
 )
-from django.db.models import Q
-from django.db import transaction
-from django.utils import timezone
-from api.services.notifications import notificar_participantes
+from api.services.lista_espera import promover_lista_espera
+from api.services.notifications import fecha_local, notificar_participantes
+
+
 # ============================================================================
 # PERMISOS PERSONALIZADOS
 # ============================================================================
@@ -31,6 +34,32 @@ class EsUsuarioAutenticado(permissions.BasePermission):
     """Permiso para usuarios autenticados"""
     def has_permission(self, request, view):
         return request.user and request.user.is_authenticated
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+def _error(mensaje, codigo=status.HTTP_400_BAD_REQUEST):
+    return Response({"error": mensaje}, status=codigo)
+
+
+def _entero(valor):
+    """Convierte a int o devuelve None (evita 500 por ids no numéricos)."""
+    if isinstance(valor, bool):
+        return None
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _motivo_bloqueo(partido):
+    """Mensaje si el partido ya no admite cambios (cancelado o con resultado), o None."""
+    if partido.estado == Partido.Estado.CANCELADO:
+        return "El partido fue cancelado"
+    if hasattr(partido, 'resultado'):
+        return "El partido ya tiene resultado cargado"
+    return None
 
 
 # ============================================================================
@@ -62,7 +91,7 @@ class RegistroView(generics.CreateAPIView):
 # USUARIO
 # ============================================================================
 class UsuarioViewSet(viewsets.GenericViewSet):
-    """ViewSet de solo lectura: perfil por id y perfil propio (me)"""
+    """ViewSet de solo lectura: perfil propio (me)"""
     queryset = Usuario.objects.all()
     serializer_class = UsuarioPerfilSerializer
     permission_classes = [EsUsuarioAutenticado]
@@ -75,6 +104,7 @@ class UsuarioViewSet(viewsets.GenericViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(UsuarioPerfilSerializer(request.user).data)
+
 
 # ============================================================================
 # CANCHA
@@ -89,28 +119,26 @@ class CanchaViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(creado_por=self.request.user)
 
+
 # ============================================================================
 # PARTIDO
 # ============================================================================
 class PartidoViewSet(viewsets.ModelViewSet):
     """ViewSet principal para partidos"""
     permission_classes = [permissions.AllowAny]
-    # Sin DELETE: la baja de un partido será lógica (pendiente)
+    # Sin DELETE: la baja es lógica (acción `cancelar`)
     http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
-    filterset_fields = ['organizador', 'cancha', 'periodicidad']
-    ordering_fields = ['fecha_hora', 'created_at']
-    ordering = ['-fecha_hora']
 
     def get_queryset(self):
         user = self.request.user
-    
+
         # Si no está autenticado, sin partidos
         if not user.is_authenticated:
             return Partido.objects.none()
-        
+
         # Solo partidos donde el usuario es organizador O participa
         return Partido.objects.filter(
-            Q(organizador=user) | 
+            Q(organizador=user) |
             Q(participaciones__usuario=user,
               participaciones__estado__in=['activo', 'en_espera'])
         ).distinct().order_by('-fecha_hora')
@@ -123,7 +151,6 @@ class PartidoViewSet(viewsets.ModelViewSet):
         return PartidoListSerializer
 
     def get_permissions(self):
-        """Solo usuarios registrados pueden crear partidos"""
         """
         - create: solo usuarios registrados
         - update/partial_update: solo el organizador (EsOrganizador se evalúa en get_object)
@@ -144,90 +171,178 @@ class PartidoViewSet(viewsets.ModelViewSet):
         serializer = serializer_class(partido, context=self.get_serializer_context())
         return Response(serializer.data)
 
+    def update(self, request, *args, **kwargs):
+        """PUT/PATCH: edita y responde con el detalle completo del partido"""
+        super().update(request, *args, **kwargs)
+        partido = self.get_object()
+        return Response(PartidoDetailSerializer(partido, context=self.get_serializer_context()).data)
+
+    def perform_update(self, serializer):
+        """Guarda los cambios, avisa a los participantes y reacomoda la lista de espera"""
+        partido = serializer.instance
+        cancha_id, fecha_hora, cupo_total = partido.cancha_id, partido.fecha_hora, partido.cupo_total
+
+        with transaction.atomic():
+            Partido.objects.select_for_update().get(pk=partido.pk)
+            partido = serializer.save()
+
+            cambios = []
+            if partido.fecha_hora != fecha_hora:
+                cambios.append(f"nueva fecha: {fecha_local(partido.fecha_hora)}")
+            if partido.cancha_id != cancha_id:
+                cambios.append(f"nueva cancha: {partido.cancha.nombre}")
+            if partido.cupo_total != cupo_total:
+                cambios.append(f"nuevo cupo: {partido.cupo_total} jugadores")
+
+            if cambios:
+                notificar_participantes(
+                    partido,
+                    tipo=Notificacion.Tipo.PARTIDO_MODIFICADO,
+                    mensaje=f"El partido fue modificado ({', '.join(cambios)})",
+                    excluir_usuario=self.request.user,
+                )
+            if partido.cupo_total != cupo_total:
+                promover_lista_espera(partido)
+
+    @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado, EsOrganizador])
+    def cancelar(self, request, pk=None):
+        """
+        Baja lógica del partido (solo organizador): lo marca como cancelado, cierra la
+        invitación y avisa a los participantes. No se puede cancelar si ya tiene resultado.
+        """
+        partido = self.get_object()
+
+        with transaction.atomic():
+            partido = Partido.objects.select_for_update().get(pk=partido.pk)
+
+            if partido.estado == Partido.Estado.CANCELADO:
+                return _error("El partido ya está cancelado")
+            if hasattr(partido, 'resultado'):
+                return _error("No se puede cancelar un partido con resultado cargado")
+
+            partido.estado = Partido.Estado.CANCELADO
+            partido.save(update_fields=['estado', 'updated_at'])
+            Invitacion.objects.filter(partido=partido).update(estado='cancelada')
+
+            notificar_participantes(
+                partido,
+                tipo=Notificacion.Tipo.PARTIDO_CANCELADO,
+                mensaje=f"El partido del {fecha_local(partido.fecha_hora)} fue cancelado por el organizador",
+                excluir_usuario=request.user,
+            )
+
+        return Response(PartidoDetailSerializer(partido, context=self.get_serializer_context()).data)
+
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def cambiar_equipo(self, request, pk=None):
         """
-        Cambiar asignación de equipo (solo el propio usuario o organizador).
+        Cambiar asignación de equipo (el propio usuario o el organizador).
         Body: {"nuevo_equipo": "B", "usuario_id": 1}
+
+        - Con los equipos ya definidos, solo el organizador puede cambiarlos.
+        - Un jugador activo necesita lugar en el equipo destino; uno en espera puede
+          cambiarse igual y sigue en espera (o pasa a activo si hay lugar).
         """
         partido = self.get_object()
-        usuario_id = request.data.get('usuario_id')
+        usuario_id = _entero(request.data.get('usuario_id'))
         nuevo_equipo = request.data.get('nuevo_equipo')
 
-        if nuevo_equipo not in ['A', 'B']:
-            return Response(
-                {"error": "Equipo debe ser 'A' o 'B'"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if nuevo_equipo not in ('A', 'B'):
+            return _error("Equipo debe ser 'A' o 'B'")
+        if usuario_id is None:
+            return _error("usuario_id inválido")
 
-        # Obtener participación
-        participacion = get_object_or_404(
-            ParticipacionPartido,
-            partido=partido,
-            usuario_id=usuario_id
-        )
+        es_organizador = partido.organizador_id == request.user.id
+        if usuario_id != request.user.id and not es_organizador:
+            return _error("No tienes permiso para cambiar este equipo", status.HTTP_403_FORBIDDEN)
 
-        # Verificar permisos
-        if participacion.usuario != request.user and partido.organizador != request.user:
-            return Response(
-                {"error": "No tienes permiso para cambiar este equipo"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+        with transaction.atomic():
+            partido = Partido.objects.select_for_update().get(pk=partido.pk)
 
-        # Validar cupo en nuevo equipo
-        if participacion.equipo_asignado != nuevo_equipo:
-            cupo_disponible = partido.cupo_disponible(nuevo_equipo)
-            if cupo_disponible <= 0:
-                return Response(
-                    {"error": "No hay cupo disponible en ese equipo"},
-                    status=status.HTTP_400_BAD_REQUEST
+            motivo = _motivo_bloqueo(partido)
+            if motivo:
+                return _error(motivo)
+            if partido.equipos_definidos and not es_organizador:
+                return _error(
+                    "Los equipos ya fueron definidos por el organizador",
+                    status.HTTP_403_FORBIDDEN,
                 )
 
-        # Cambiar equipo
-        participacion.equipo_asignado = nuevo_equipo
-        participacion.save()
-
-        # Crear notificación si lo cambió el organizador
-        if partido.organizador == request.user:
-            Notificacion.objects.create(
-                usuario=participacion.usuario,
+            participacion = get_object_or_404(
+                ParticipacionPartido.objects.select_for_update(),
                 partido=partido,
-                tipo=Notificacion.Tipo.CAMBIO_EQUIPO,
-                mensaje=f"Tu equipo ha sido cambiado a Equipo {nuevo_equipo}"
+                usuario_id=usuario_id,
             )
+            if participacion.estado == 'baneado':
+                return _error("El jugador está baneado de este partido")
 
-        serializer = ParticipacionPartidoSerializer(participacion)
-        return Response(serializer.data)
+            if participacion.equipo_asignado != nuevo_equipo:
+                if participacion.estado == 'activo' and partido.cupo_disponible(nuevo_equipo) <= 0:
+                    return _error("No hay cupo disponible en ese equipo")
 
-    @action(detail=True, methods=['post'], permission_classes=[EsOrganizador])
+                participacion.equipo_asignado = nuevo_equipo
+                participacion.save(update_fields=['equipo_asignado'])
+
+                # Avisar solo si lo movió otra persona
+                if participacion.usuario_id != request.user.id and participacion.usuario.is_registered:
+                    Notificacion.objects.create(
+                        usuario=participacion.usuario,
+                        partido=partido,
+                        tipo=Notificacion.Tipo.CAMBIO_EQUIPO,
+                        mensaje=f"Tu equipo ha sido cambiado a Equipo {nuevo_equipo}",
+                    )
+
+                # Se liberó un lugar en el equipo anterior (o el en espera ahora tiene lugar)
+                promover_lista_espera(partido)
+
+            participacion.refresh_from_db()
+
+        return Response(ParticipacionPartidoSerializer(participacion).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado, EsOrganizador])
     def banear(self, request, pk=None):
         """
-        Banear a un participante del partido.
+        Banear a un participante del partido (solo organizador). Libera su lugar y
+        promueve a quien esté primero en la lista de espera de ese equipo.
         Body: {"usuario_id": 1}
         """
         partido = self.get_object()
-        self.check_object_permissions(request, partido)
+        usuario_id = _entero(request.data.get('usuario_id'))
 
-        usuario_id = request.data.get('usuario_id')
-        participacion = get_object_or_404(
-            ParticipacionPartido,
-            partido=partido,
-            usuario_id=usuario_id
-        )
+        if usuario_id is None:
+            return _error("usuario_id inválido")
+        if usuario_id == partido.organizador_id:
+            return _error("El organizador no puede banearse a sí mismo")
 
-        participacion.estado = 'baneado'
-        participacion.save()
+        with transaction.atomic():
+            partido = Partido.objects.select_for_update().get(pk=partido.pk)
 
-        # Crear notificación
-        Notificacion.objects.create(
-            usuario=participacion.usuario,
-            partido=partido,
-            tipo=Notificacion.Tipo.BANEADO,
-            mensaje=f"Has sido baneado del partido del {partido.fecha_hora.strftime('%d/%m/%Y')}"
-        )
+            motivo = _motivo_bloqueo(partido)
+            if motivo:
+                return _error(motivo)
 
-        serializer = ParticipacionPartidoSerializer(participacion)
-        return Response(serializer.data)
+            participacion = get_object_or_404(
+                ParticipacionPartido.objects.select_for_update(),
+                partido=partido,
+                usuario_id=usuario_id,
+            )
+            if participacion.estado == 'baneado':
+                return _error("El jugador ya está baneado")
+
+            participacion.estado = 'baneado'
+            participacion.save(update_fields=['estado'])
+
+            if participacion.usuario.is_registered:
+                Notificacion.objects.create(
+                    usuario=participacion.usuario,
+                    partido=partido,
+                    tipo=Notificacion.Tipo.BANEADO,
+                    mensaje=f"Has sido baneado del partido del {fecha_local(partido.fecha_hora, '%d/%m/%Y')}",
+                )
+
+            promover_lista_espera(partido)
+
+        return Response(ParticipacionPartidoSerializer(participacion).data)
 
     @action(detail=True, methods=['post'], permission_classes=[EsUsuarioAutenticado])
     def definir_equipos(self, request, pk=None):
@@ -238,29 +353,18 @@ class PartidoViewSet(viewsets.ModelViewSet):
         partido = self.get_object()
 
         if partido.organizador != request.user:
-            return Response(
-                {"error": "Solo el organizador puede definir equipos"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            return _error("Solo el organizador puede definir equipos", status.HTTP_403_FORBIDDEN)
 
-        if hasattr(partido, 'resultado'):
-            return Response(
-                {"error": "El partido ya tiene resultado cargado"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        motivo = _motivo_bloqueo(partido)
+        if motivo:
+            return _error(motivo)
 
         equipos_data = request.data.get('equipos')
         if not isinstance(equipos_data, dict) or set(equipos_data.keys()) != {'A', 'B'}:
-            return Response(
-                {"error": "Debes enviar exactamente los equipos 'A' y 'B'"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return _error("Debes enviar exactamente los equipos 'A' y 'B'")
 
         if not equipos_data['A'] or not equipos_data['B']:
-            return Response(
-                {"error": "Debes especificar usuarios para ambos equipos"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return _error("Debes especificar usuarios para ambos equipos")
 
         try:
             asignaciones = {
@@ -268,17 +372,11 @@ class PartidoViewSet(viewsets.ModelViewSet):
                 for equipo, ids in equipos_data.items()
             }
         except (TypeError, ValueError):
-            return Response(
-                {"error": "Los ids de jugadores son inválidos"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return _error("Los ids de jugadores son inválidos")
 
         todos = asignaciones['A'] + asignaciones['B']
         if len(todos) != len(set(todos)):
-            return Response(
-                {"error": "Un jugador no puede estar en ambos equipos ni repetido"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return _error("Un jugador no puede estar en ambos equipos ni repetido")
 
         with transaction.atomic():
             activos = set(
@@ -287,10 +385,7 @@ class PartidoViewSet(viewsets.ModelViewSet):
                 .values_list('usuario_id', flat=True)
             )
             if not set(todos).issubset(activos):
-                return Response(
-                    {"error": "Hay jugadores que no participan activamente del partido"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                return _error("Hay jugadores que no participan activamente del partido")
 
             for equipo, ids in asignaciones.items():
                 partido.participaciones.filter(usuario_id__in=ids).update(equipo_asignado=equipo)
@@ -299,6 +394,8 @@ class PartidoViewSet(viewsets.ModelViewSet):
             partido.save(update_fields=['equipos_definidos', 'updated_at'])
 
         return Response(PartidoDetailSerializer(partido).data)
+
+
 # ============================================================================
 # RESULTADO Y ESTADÍSTICAS
 # ============================================================================
@@ -313,10 +410,9 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return Resultado.objects.none()
-        
-        from django.db.models import Q
+
         return Resultado.objects.filter(
-            Q(partido__organizador=user) | 
+            Q(partido__organizador=user) |
             Q(partido__participaciones__usuario=user)
         ).distinct().order_by('-fecha_carga')
 
@@ -334,7 +430,6 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
             ]
         }
         """
-        partido_id = request.data.get('partido_id')
         equipo_a_goles = request.data.get('equipo_a_goles')
         equipo_b_goles = request.data.get('equipo_b_goles')
         estadisticas_data = request.data.get('estadisticas', [])
@@ -357,6 +452,9 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
                 {"error": "Solo el organizador puede cargar resultado"},
                 status=status.HTTP_403_FORBIDDEN
             )
+
+        if partido.estado == Partido.Estado.CANCELADO:
+            return error("El partido fue cancelado")
 
         if not partido.equipos_definidos:
             return error("Los equipos deben estar definidos antes de cargar resultado")
@@ -460,7 +558,6 @@ class ResultadoViewSet(viewsets.ReadOnlyModelViewSet):
 # NOTIFICACIÓN
 # ============================================================================
 class NotificacionViewSet(viewsets.ReadOnlyModelViewSet):
-
     """ViewSet para notificaciones del usuario autenticado"""
     serializer_class = NotificacionSerializer
     permission_classes = [EsUsuarioAutenticado]
@@ -502,13 +599,13 @@ class InvitacionPorCodigoView(APIView):
 
     def get(self, request, codigo):
         invitacion = get_object_or_404(Invitacion, codigo_unico=codigo)
-        
+
         if not invitacion.esta_activa():
             return Response(
                 {'detail': 'Esta invitación ha expirado o fue cancelada'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         partido = invitacion.partido
         serializer = PartidoPublicoSerializer(partido)
         return Response({'partido': serializer.data})

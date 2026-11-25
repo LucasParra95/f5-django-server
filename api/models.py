@@ -133,6 +133,9 @@ class Partido(models.Model):
     - Tiene cupo de jugadores
     - Los equipos se definen antes de cargar resultado (equipos_definidos)
     """
+    class Estado(models.TextChoices):
+        PROGRAMADO = 'programado', 'Programado'
+        CANCELADO = 'cancelado', 'Cancelado'
     PERIODICIDAD_CHOICES = [
         ('unico', 'Único'),
         ('semanal', 'Semanal'),
@@ -145,6 +148,7 @@ class Partido(models.Model):
     cupo_total = models.IntegerField(validators=[MinValueValidator(4), MaxValueValidator(40)])  # Mínimo 4, máximo 40 jugadores
     periodicidad = models.CharField(max_length=20, choices=PERIODICIDAD_CHOICES, default='unico')
     equipos_definidos = models.BooleanField(default=False)
+    estado = models.CharField(max_length=20, choices=Estado.choices, default=Estado.PROGRAMADO)
     # Resultado se accede via: partido_instance.resultado (reverse relation)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -312,6 +316,7 @@ class Notificacion(models.Model):
         PARTICIPANTE_NUEVO = 'participante_nuevo', 'Nuevo participante'
         CAMBIO_EQUIPO = 'cambio_equipo', 'Cambio de equipo'
         BANEADO = 'baneado', 'Has sido baneado'
+        PROMOVIDO = 'promovido', 'Pasaste de la lista de espera a jugar'
         OTRO = 'otro', 'Otro'
 
     id = models.AutoField(primary_key=True)
